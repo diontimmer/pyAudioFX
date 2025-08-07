@@ -1,0 +1,6 @@
+pedalboard
+PyQt6
+qdarktheme
+sounddevice
+soundfile
+tqdm
