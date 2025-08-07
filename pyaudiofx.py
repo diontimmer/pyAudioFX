@@ -11,7 +11,6 @@ from typing import List
 
 # ─── 3rd-party ─────────────────────────────────────────────────────────────
 import numpy as np
-import soundfile as sf
 import sounddevice as sd
 from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction, QFont, QColor, QIcon
@@ -29,12 +28,13 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QVBoxLayout,
     QComboBox,
+    QDoubleSpinBox,
 )
 from PyQt6.Qsci import QsciScintilla, QsciLexerPython
-
 import qdarktheme
 from tqdm import tqdm
 from pedalboard import Pedalboard
+from pedalboard.io import AudioFile
 
 # ─── constants ─────────────────────────────────────────────────────────────
 HERE = Path(__file__).resolve().parent
@@ -45,6 +45,7 @@ DEFAULT_SETTINGS = {
     "batch_root": str(Path.home()),
     "batch_suffix": "processed",
     "batch_workers": 4,
+    "batch_tail_samples": 0,
 }
 DRACULA = {
     "bg": "#282a36",
@@ -137,6 +138,18 @@ def extract_board(mod: ModuleType) -> Pedalboard | None:
     return Pedalboard(mod.effected)
 
 
+def load_audio(path: str) -> np.ndarray:
+    """
+    Load audio from a file, ensuring it is always 2D (channels, samples).
+    """
+    with AudioFile(path, "r") as f:
+        audio = f.read(f.frames)
+        if audio.ndim == 1:
+            audio = np.expand_dims(audio, axis=1)
+        sr = f.samplerate
+    return audio.T, sr
+
+
 # -----------------------------------------------------------------------------
 # Worker objects
 # -----------------------------------------------------------------------------
@@ -153,14 +166,9 @@ class AudioWorker(QObject):
 
     def run(self):
         try:
-            audio, sr = sf.read(self.path, always_2d=False)
-            if audio.ndim == 1:
-                audio = np.expand_dims(audio, 0)
-
-            board = extract_board(self.module)
-            processed = board(audio, sr)
-
-            self.finished.emit(np.asarray(processed), sr)
+            audio, sr = load_audio(str(self.path))
+            processed = extract_board(self.module)(audio, sr)
+            self.finished.emit(np.asarray(processed), int(sr))
         except Exception as e:
             self.error.emit(str(e))
 
@@ -176,25 +184,30 @@ class BatchWorker(QObject):
         module: ModuleType,
         suffix: str,
         workers: int,
+        batch_tail_samples: int,
     ):
         super().__init__()
         self.root = root
         self.module = module
         self.suffix = suffix
         self.workers = workers
+        self.batch_tail_samples = batch_tail_samples
 
     def _process_one(self, path: Path):
         try:
-            audio, sr = sf.read(path, always_2d=False)
-            if audio.ndim == 1:
-                audio = np.expand_dims(audio, 0)
+            audio, sr = load_audio(str(path))  # ← CHANGED
+            # if tail samples, add them to the end of the audio, the shape is 42000, 2
+            if self.batch_tail_samples > 0:
+                tail = np.zeros(
+                    (self.batch_tail_samples, audio.shape[1]), dtype=audio.dtype
+                )
+                audio = np.concatenate((audio, tail), axis=0)
             board = extract_board(self.module)
-            if board is not None:
-                processed = board(audio, sr)
-            else:
-                processed = self.module.process(audio, sr)
+            processed = board(audio, sr)
             out_path = path.with_stem(f"{path.stem}_{self.suffix}").with_suffix(".wav")
-            sf.write(out_path, processed, sr, format="WAV", subtype="FLOAT")
+            # write with pedalboard
+            with AudioFile(str(out_path), "w", sr, 2) as f:
+                f.write(processed.T)
         except Exception as exc:
             tqdm.write(f"❌ {path}: {exc}")
 
@@ -250,12 +263,20 @@ class BatchDialog(QDialog):
         self.workers_spin.setRange(1, 64)
         self.workers_spin.setValue(4)
 
+        # Add Tail Samples Amount
+        self.tail_samples_spin = QDoubleSpinBox()
+        self.tail_samples_spin.setRange(0, 2147483647)
+        self.tail_samples_spin.setDecimals(2)
+        self.tail_samples_spin.setValue(0.0)
+        self.tail_samples_spin.setSingleStep(0.01)
+
         self.start_btn = QPushButton("Start")
         self.start_btn.clicked.connect(self._begin)
 
         self.root_edit.setText(s["batch_root"])
         self.suffix_edit.setText(s["batch_suffix"])
         self.workers_spin.setValue(s["batch_workers"])
+        self.tail_samples_spin.setValue(s.get("batch_tail_samples", 0))
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Root folder:"))
@@ -264,6 +285,8 @@ class BatchDialog(QDialog):
         layout.addWidget(self.suffix_edit)
         layout.addWidget(QLabel("Concurrent workers:"))
         layout.addWidget(self.workers_spin)
+        layout.addWidget(QLabel("Tail seconds to append:"))
+        layout.addWidget(self.tail_samples_spin)
         layout.addStretch(1)
         layout.addWidget(self.start_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
@@ -293,6 +316,7 @@ class BatchDialog(QDialog):
             self.parent.current_module,
             self.suffix_edit.text(),
             self.workers_spin.value(),
+            int(self.tail_samples_spin.value() * 48000),
         )
         self.worker.moveToThread(self.worker_thread)
 
@@ -309,6 +333,7 @@ class BatchDialog(QDialog):
             batch_root=str(root),
             batch_suffix=self.suffix_edit.text(),
             batch_workers=self.workers_spin.value(),
+            batch_tail_samples=self.tail_samples_spin.value(),
         )
         save_settings(self.parent.settings)
         # self.accept()  # close dialog
@@ -412,12 +437,21 @@ class PyFXLab(QMainWindow):
             """\
 from pedalboard import Chorus, Reverb\n
 effected = [Chorus(), Reverb(room_size=0.6)]\n
+info = {
+	"prompt": ["reverb", "a good amount of reverb", "60% reverb"] # instruct insert 'add reverb', 'remove reverb' etc
+}
+
+
 """
         )
 
         # Toolbar -------------------------------------------------------------
         tool_bar = QToolBar(self)
         self.addToolBar(tool_bar)
+
+        compile_act = QAction("⚙️ Compile", self)
+        compile_act.triggered.connect(self.compile_and_process)
+        tool_bar.addAction(compile_act)
 
         self.indicator = QLabel("🔴")  # compile status
         tool_bar.addWidget(self.indicator)
@@ -444,18 +478,17 @@ effected = [Chorus(), Reverb(room_size=0.6)]\n
 
         load_audio_act = QAction("📂 Load Audio…", self)
         load_audio_act.triggered.connect(self.load_audio)
+
         tool_bar.addAction(load_audio_act)
 
         open_script_act = QAction("📖 Open Script", self)
         save_script_act = QAction("💾 Save Script", self)
-        compile_act = QAction("⚙️ Compile", self)
         batch_act = QAction("📊 Batch", self)
         play_dry_act = QAction("▶️ Dry", self)
         play_wet_act = QAction("▶️ Wet", self)
         stop_audio_act = QAction("⏹️ Stop Audio", self)
 
         for act, slot in [
-            (compile_act, self.compile_and_process),
             (play_dry_act, self.play_dry_audio),
             (play_wet_act, self.play_audio),
             (stop_audio_act, self.stop_audio),
@@ -478,8 +511,10 @@ effected = [Chorus(), Reverb(room_size=0.6)]\n
 
         play_dry_act.setEnabled(False)
         play_wet_act.setEnabled(False)
+        batch_act.setEnabled(False)
         self._play_dry_act = play_dry_act
         self._play_wet_act = play_wet_act
+        self._batch_act = batch_act
 
         self.setCentralWidget(self.editor)
 
@@ -519,6 +554,9 @@ effected = [Chorus(), Reverb(room_size=0.6)]\n
             save_settings(self.settings)
             self.statusBar().showMessage(f"Loaded {self.audio_path.name}")
             self._play_wet_act.setEnabled(False)
+            self._batch_act.setEnabled(False)
+            self.indicator.setText("🔴")
+            self.processed = None
             self._play_dry_act.setEnabled(True)
 
     def stop_audio(self):
@@ -551,13 +589,14 @@ effected = [Chorus(), Reverb(room_size=0.6)]\n
 
     def on_processed(self, audio: object, sr: int):
         self.processed = audio  # type: ignore[assignment]
-        self.sr = sr
+        self.sr = sr  # -467013872 for some reason
         self.current_module = load_user_module(
             self.editor.text()
         )  # save compiled module
         self.indicator.setText("🟢")
         self._play_wet_act.setEnabled(True)
         self._play_dry_act.setEnabled(True)
+        self._batch_act.setEnabled(True)
         if self.device_combo.currentData() != -1:  # live mode is on → restart
             self.live.start(
                 self.device_combo.currentData(), extract_board(self.current_module)
@@ -600,12 +639,10 @@ effected = [Chorus(), Reverb(room_size=0.6)]\n
         if self.audio_path is None:
             return
         try:
-            audio, sr = sf.read(self.audio_path, dtype=np.float32, always_2d=True)
-            # Clip to prevent distortion
-            audio = np.clip(audio, -1.0, 1.0)
-
-            # Play asynchronously
-            sd.play(audio, samplerate=sr)
+            audio, sr = load_audio(str(self.audio_path))  # ← CHANGED
+            if audio.ndim == 1:
+                audio = np.expand_dims(audio, axis=1)
+            sd.play(np.clip(audio, -1.0, 1.0), samplerate=sr)
         except Exception as e:
             QMessageBox.warning(self, "Playback Error", f"Could not play audio: {e}")
 
