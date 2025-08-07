@@ -4,6 +4,10 @@
 
 ---
 
+![pyAudioFX Screenshot](shot.png)
+
+---
+
 ## Features
 
 - 🎛️ **Scriptable Effects:** Write Python scripts to define your audio effect chains using Pedalboard plugins and VST3.
