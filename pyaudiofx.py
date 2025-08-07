@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from types import ModuleType
 from typing import List
+import threading
+import time
 
 # ─── 3rd-party ─────────────────────────────────────────────────────────────
 import numpy as np
@@ -29,12 +31,15 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QComboBox,
     QDoubleSpinBox,
+    QWidget,
+    QToolButton,
 )
+
 from PyQt6.Qsci import QsciScintilla, QsciLexerPython
 import qdarktheme
 from tqdm import tqdm
 from pedalboard import Pedalboard
-from pedalboard.io import AudioFile
+from pedalboard.io import AudioFile, AudioStream
 
 # ─── constants ─────────────────────────────────────────────────────────────
 HERE = Path(__file__).resolve().parent
@@ -45,7 +50,7 @@ DEFAULT_SETTINGS = {
     "batch_root": str(Path.home()),
     "batch_suffix": "processed",
     "batch_workers": 4,
-    "batch_tail_samples": 0,
+    "tail_seconds": 0,
 }
 DRACULA = {
     "bg": "#282a36",
@@ -138,7 +143,7 @@ def extract_board(mod: ModuleType) -> Pedalboard | None:
     return Pedalboard(mod.effected)
 
 
-def load_audio(path: str) -> np.ndarray:
+def load_audio_from_path(path: str) -> np.ndarray:
     """
     Load audio from a file, ensuring it is always 2D (channels, samples).
     """
@@ -147,6 +152,7 @@ def load_audio(path: str) -> np.ndarray:
         if audio.ndim == 1:
             audio = np.expand_dims(audio, axis=1)
         sr = f.samplerate
+
     return audio.T, sr
 
 
@@ -159,14 +165,20 @@ class AudioWorker(QObject):
     finished = pyqtSignal(object, int)  # ndarray, sr
     error = pyqtSignal(str)
 
-    def __init__(self, path: Path, module: ModuleType):
+    def __init__(self, path: Path, module: ModuleType, tail_seconds: int):
         super().__init__()
         self.path = path
         self.module = module
+        self.tail_seconds = tail_seconds
 
     def run(self):
         try:
-            audio, sr = load_audio(str(self.path))
+            audio, sr = load_audio_from_path(str(self.path))
+            if self.tail_seconds > 0:
+                tail = np.zeros(
+                    (int(self.tail_seconds * sr), audio.shape[1]), dtype=audio.dtype
+                )
+                audio = np.concatenate((audio, tail), axis=0)
             processed = extract_board(self.module)(audio, sr)
             self.finished.emit(np.asarray(processed), int(sr))
         except Exception as e:
@@ -184,22 +196,22 @@ class BatchWorker(QObject):
         module: ModuleType,
         suffix: str,
         workers: int,
-        batch_tail_samples: int,
+        batch_tail_seconds: int,
     ):
         super().__init__()
         self.root = root
         self.module = module
         self.suffix = suffix
         self.workers = workers
-        self.batch_tail_samples = batch_tail_samples
+        self.batch_tail_seconds = batch_tail_seconds
 
     def _process_one(self, path: Path):
         try:
-            audio, sr = load_audio(str(path))  # ← CHANGED
+            audio, sr = load_audio_from_path(str(path))  # ← CHANGED
             # if tail samples, add them to the end of the audio, the shape is 42000, 2
-            if self.batch_tail_samples > 0:
+            if self.batch_tail_seconds > 0:
                 tail = np.zeros(
-                    (self.batch_tail_samples, audio.shape[1]), dtype=audio.dtype
+                    (self.batch_tail_seconds * sr, audio.shape[1]), dtype=audio.dtype
                 )
                 audio = np.concatenate((audio, tail), axis=0)
             board = extract_board(self.module)
@@ -264,11 +276,12 @@ class BatchDialog(QDialog):
         self.workers_spin.setValue(4)
 
         # Add Tail Samples Amount
-        self.tail_samples_spin = QDoubleSpinBox()
-        self.tail_samples_spin.setRange(0, 2147483647)
-        self.tail_samples_spin.setDecimals(2)
-        self.tail_samples_spin.setValue(0.0)
-        self.tail_samples_spin.setSingleStep(0.01)
+        self.tail_seconds_spin = QDoubleSpinBox()
+        self.tail_seconds_spin.setRange(0, 2147483647)
+        self.tail_seconds_spin.setDecimals(2)
+        self.tail_seconds_spin.setValue(parent.tail_seconds)  # convert to seconds
+        self.tail_seconds_spin.setSingleStep(0.01)
+        self.tail_seconds_spin.setSuffix(" sec")
 
         self.start_btn = QPushButton("Start")
         self.start_btn.clicked.connect(self._begin)
@@ -276,7 +289,7 @@ class BatchDialog(QDialog):
         self.root_edit.setText(s["batch_root"])
         self.suffix_edit.setText(s["batch_suffix"])
         self.workers_spin.setValue(s["batch_workers"])
-        self.tail_samples_spin.setValue(s.get("batch_tail_samples", 0))
+        self.tail_seconds_spin.setValue(s.get("tail_seconds", 0))
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Root folder:"))
@@ -286,7 +299,7 @@ class BatchDialog(QDialog):
         layout.addWidget(QLabel("Concurrent workers:"))
         layout.addWidget(self.workers_spin)
         layout.addWidget(QLabel("Tail seconds to append:"))
-        layout.addWidget(self.tail_samples_spin)
+        layout.addWidget(self.tail_seconds_spin)
         layout.addStretch(1)
         layout.addWidget(self.start_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
@@ -316,7 +329,7 @@ class BatchDialog(QDialog):
             self.parent.current_module,
             self.suffix_edit.text(),
             self.workers_spin.value(),
-            int(self.tail_samples_spin.value() * 48000),
+            int(self.tail_seconds_spin.value()),
         )
         self.worker.moveToThread(self.worker_thread)
 
@@ -333,8 +346,12 @@ class BatchDialog(QDialog):
             batch_root=str(root),
             batch_suffix=self.suffix_edit.text(),
             batch_workers=self.workers_spin.value(),
-            batch_tail_samples=self.tail_samples_spin.value(),
+            tail_seconds=self.tail_seconds_spin.value(),
         )
+
+        # set parent tail seconds
+        self.parent.tail_seconds_spin.setValue(self.tail_seconds_spin.value())
+
         save_settings(self.parent.settings)
         # self.accept()  # close dialog
 
@@ -349,60 +366,62 @@ class LiveEngine:
     """Manage a realtime audio stream that passes input → board → output."""
 
     def __init__(self):
-        self.stream: sd.Stream | None = None
-        self.board: Pedalboard | None = None
-        self.sr: int = 48000
+        self.stream: AudioStream | None = None
+        self._thread: threading.Thread | None = None
 
-    def start(self, device_idx: int, board: Pedalboard, sr: int = 48000):
-        self.stop()  # restart if already running
-        self.board, self.sr = board, sr
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def start(self, input_device_idx: int, board: Pedalboard, sr: int = 48_000):
+        """
+        Begin live monitoring on the chosen input device.
 
-        def callback(indata, outdata, frames, time, status):
-            if status:
-                tqdm.write(f"⚠️  {status}")
-            processed = self.board(indata.T, sr).T  # pedalboard: (ch, N)
-            outdata[:] = np.clip(processed, -1, 1)
+        Parameters
+        ----------
+        input_device_idx : int
+            Index from sounddevice.query_devices().
+        board : Pedalboard
+            The effect chain to run live audio through.
+        sr : int
+            Desired sample-rate for the stream. 48 kHz is a safe default.
+        """
+        self.stop()  # shut down any existing stream first
 
-        self.stream = sd.Stream(
-            samplerate=sr,
-            blocksize=0,
-            dtype="float32",
-            channels=2,
-            callback=callback,
-            device=(device_idx, None),  # (input, output) – output=None = default
+        if input_device_idx == -1:
+            return  # “None” selected in the UI – nothing to do
+
+        input_name = AudioStream.input_device_names[input_device_idx]
+        output_name = AudioStream.default_output_device_name
+
+        # Create the AudioStream (doesn't start until __enter__ is called)
+        self.stream = AudioStream(
+            input_device_name=input_name,
+            output_device_name=output_name,
+            sample_rate=sr,
+            buffer_size=512,
+            plugins=board,
         )
-        block = 512  # <— 10 ms @ 48 kHz; tweak if needed
 
-        def callback(indata, outdata, frames, time, status):
-            if status.input_overflow:
-                tqdm.write("⚠️ input overflow")
-            try:
-                # Pedalboard expects (channels, N)
-                processed = self.board(indata.T, sr)  # returns (ch, N)
-                np.clip(processed, -1, 1, out=processed)
-                outdata[:] = processed.T  # back to (N, ch)
-            except Exception as exc:
-                outdata[:] = 0
-                tqdm.write(f"❌ live callback error: {exc}")
+        def _run_stream(as_instance: AudioStream):
+            with as_instance:
+                while as_instance.running:  # keep thread alive
+                    time.sleep(0.1)  # sleep briefly to avoid busy-waiting
 
-        self.stream = sd.Stream(
-            samplerate=sr,
-            blocksize=block,
-            dtype="float32",
-            latency="high",  # let PortAudio choose a safe buffer
-            channels=2,
-            callback=callback,
-            device=(device_idx, None),  # (input, output)
+        self._thread = threading.Thread(
+            target=_run_stream, args=(self.stream,), daemon=True
         )
-        self.stream.start()
-        tqdm.write("🔈 Live-monitoring started.")
+        self._thread.start()
+        tqdm.write("🔈 Live-monitoring started via AudioStream.")
 
     def stop(self):
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
+        """Stop and clean up the live stream (if one is running)."""
+        if self.stream is not None:
+            self.stream.close()  # also stops if running
             self.stream = None
             tqdm.write("⏹️  Live-monitoring stopped.")
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+            self._thread = None
 
 
 # -----------------------------------------------------------------------------
@@ -438,24 +457,27 @@ class PyFXLab(QMainWindow):
 from pedalboard import Chorus, Reverb\n
 effected = [Chorus(), Reverb(room_size=0.6)]\n
 info = {
-	"prompt": ["reverb", "a good amount of reverb", "60% reverb"] # instruct insert 'add reverb', 'remove reverb' etc
+    "prompt": ["reverb", "a good amount of reverb", "60% reverb"] # instruct insert 'add reverb', 'remove reverb' etc
 }
 
 
 """
         )
 
-        # Toolbar -------------------------------------------------------------
-        tool_bar = QToolBar(self)
-        self.addToolBar(tool_bar)
+        # Top Toolbar ---------------------------------------------------------
+        top_tool_bar = QToolBar(self)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, top_tool_bar)
 
         compile_act = QAction("⚙️ Compile", self)
         compile_act.triggered.connect(self.compile_and_process)
-        tool_bar.addAction(compile_act)
+        top_tool_bar.addAction(compile_act)
 
         self.indicator = QLabel("🔴")  # compile status
-        tool_bar.addWidget(self.indicator)
-        tool_bar.addSeparator()
+        top_tool_bar.addWidget(self.indicator)
+
+        # Left Toolbar --------------------------------------------------------
+        left_tool_bar = QToolBar(self)
+        self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, left_tool_bar)
 
         self.live = LiveEngine()  # <-- keep a single engine instance
 
@@ -463,51 +485,99 @@ info = {
         self.input_box = QLabel(" 🎙️ Input:")
         self.device_combo = QComboBox()
         self.device_combo.addItem("None", -1)
-        for idx, dev in enumerate(sd.query_devices()):
-            if dev["max_input_channels"] > 0:
-                self.device_combo.addItem(f"{idx}: {dev['name']}", idx)
+        for idx, dev in enumerate(AudioStream.input_device_names):
+            self.device_combo.addItem(f"{idx}: {dev}", idx)
 
         self.device_combo.setMaximumWidth(200)
 
-        tool_bar.addWidget(self.input_box)
-        tool_bar.addWidget(self.device_combo)
+        left_tool_bar.addWidget(self.input_box)
+        left_tool_bar.addWidget(self.device_combo)
 
         self.device_combo.currentIndexChanged.connect(self._on_device_change)
 
-        tool_bar.addSeparator()
+        left_tool_bar.addSeparator()
 
         load_audio_act = QAction("📂 Load Audio…", self)
         load_audio_act.triggered.connect(self.load_audio)
 
-        tool_bar.addAction(load_audio_act)
+        left_tool_bar.addAction(load_audio_act)
 
         open_script_act = QAction("📖 Open Script", self)
         save_script_act = QAction("💾 Save Script", self)
         batch_act = QAction("📊 Batch", self)
         play_dry_act = QAction("▶️ Dry", self)
         play_wet_act = QAction("▶️ Wet", self)
-        stop_audio_act = QAction("⏹️ Stop Audio", self)
+        stop_audio_act = QAction("⏹️ Stop", self)
 
-        for act, slot in [
-            (play_dry_act, self.play_dry_audio),
-            (play_wet_act, self.play_audio),
-            (stop_audio_act, self.stop_audio),
-        ]:
-            tool_bar.addAction(act)
-            btn = tool_bar.widgetForAction(act)  # QToolButton created by QToolBar
-            btn.pressed.connect(lambda s=slot: QTimer.singleShot(0, s))
+        # tail seconds spinbox (label to the left of spinbox)
+        tail_row = QWidget()
+        tail_layout = QHBoxLayout(tail_row)
+        tail_layout.setContentsMargins(0, 0, 0, 0)
+        tail_layout.setSpacing(2)
 
-        tool_bar.addSeparator()
+        self.tail_seconds_label = QLabel("Tail Seconds:")
+        self.tail_seconds_spin = QDoubleSpinBox()
+        self.tail_seconds_spin.setRange(0, 2147483647)
+        self.tail_seconds_spin.setDecimals(2)
+        self.tail_seconds_spin.setValue(self.settings.get("tail_seconds", 0))
+        self.tail_seconds_spin.setSingleStep(0.01)
+        self.tail_seconds_spin.setSuffix(" sec")
+        self.tail_seconds_spin.setToolTip("Tail seconds to append to processed audio")
+        self.tail_seconds_spin.setMaximumWidth(100)
+
+        tail_layout.addWidget(self.tail_seconds_label)
+        tail_layout.addWidget(self.tail_seconds_spin)
+        left_tool_bar.addWidget(tail_row)
+
+        self.tail_seconds_spin.setValue(self.settings.get("tail_seconds", 0))
+
+        # set settings on tail seconds spinbox change, set the dict key tail_seconds
+
+        def on_tail_seconds_change(value: float):
+            self.settings["tail_seconds"] = int(value)
+            save_settings(self.settings)
+
+        self.tail_seconds_spin.valueChanged.connect(on_tail_seconds_change)
+
+        # --- Transport controls ----------------------------------------------------
+        transport = QWidget()  # acts as a horizontal row
+        t_layout = QHBoxLayout(transport)
+        t_layout.setContentsMargins(0, 0, 0, 0)
+        t_layout.setSpacing(2)  # tighten spacing a little
+
+        # Helper to turn an action into a QToolButton and wire it up quickly
+        def _make_btn(action: QAction, slot):
+            btn = QToolButton()
+            btn.setDefaultAction(action)  # text/icon come from the QAction
+            btn.setAutoRaise(True)
+            btn.pressed.connect(slot)  # fire on *press* not release
+            t_layout.addWidget(btn)
+            return btn
+
+        _make_btn(play_dry_act, self.play_dry_audio)
+        _make_btn(play_wet_act, self.play_audio)
+        _make_btn(stop_audio_act, self.stop_audio)
+
+        # ------------- Export button ------------------------------------------------
+        export_act = QAction("💾", self)
+        export_act.setEnabled(False)  # stays disabled until audio processed
+        export_act.triggered.connect(self.export_audio)
+        self._export_act = export_act  # save so we can (de)activate later
+        _make_btn(export_act, self.export_audio)
+
+        left_tool_bar.addWidget(transport)
+
+        left_tool_bar.addSeparator()
 
         batch_act.triggered.connect(self.open_batch_dialog)
-        tool_bar.addAction(batch_act)
+        left_tool_bar.addAction(batch_act)
 
         # add open save that gets triggered on trigger
         open_script_act.triggered.connect(self.open_script)
-        tool_bar.addAction(open_script_act)
+        left_tool_bar.addAction(open_script_act)
 
         save_script_act.triggered.connect(self.save_script)
-        tool_bar.addAction(save_script_act)
+        left_tool_bar.addAction(save_script_act)
 
         play_dry_act.setEnabled(False)
         play_wet_act.setEnabled(False)
@@ -558,10 +628,42 @@ info = {
             self.indicator.setText("🔴")
             self.processed = None
             self._play_dry_act.setEnabled(True)
+            self._export_act.setEnabled(False)
 
     def stop_audio(self):
         """Stop any currently playing audio."""
         sd.stop()
+
+    def export_audio(self):
+        """Write the last processed buffer to a user-chosen .wav file."""
+        if self.processed is None:
+            QMessageBox.warning(
+                self, "Nothing to export", "Process some audio first (⚙️ Compile)."
+            )
+            return
+
+        # Suggest a sensible default file name
+        suggested = self.audio_path.with_stem(
+            f"{self.audio_path.stem}_processed"
+        ).with_suffix(".wav")
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export processed audio",
+            str(suggested),
+            "WAV (*.wav)",
+        )
+        if not out_path:
+            return  # user cancelled
+
+        # Ensure shape = (ch, N) before writing
+        data = np.asarray(self.processed, dtype=np.float32).T
+
+        try:
+            with AudioFile(out_path, "w", self.sr, data.shape[0]) as f:
+                f.write(data)
+            QMessageBox.information(self, "Export complete", f"Saved to:\n{out_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export error", str(exc))
 
     # ---------- Compile & preview ----------
     def compile_and_process(self):
@@ -577,7 +679,9 @@ info = {
             return
 
         self.thread = QThread()
-        self.worker = AudioWorker(self.audio_path, module)
+        self.worker = AudioWorker(
+            self.audio_path, module, self.settings["tail_seconds"]
+        )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.on_processed)
@@ -589,7 +693,7 @@ info = {
 
     def on_processed(self, audio: object, sr: int):
         self.processed = audio  # type: ignore[assignment]
-        self.sr = sr  # -467013872 for some reason
+        self.sr = sr
         self.current_module = load_user_module(
             self.editor.text()
         )  # save compiled module
@@ -597,6 +701,7 @@ info = {
         self._play_wet_act.setEnabled(True)
         self._play_dry_act.setEnabled(True)
         self._batch_act.setEnabled(True)
+        self._export_act.setEnabled(True)
         if self.device_combo.currentData() != -1:  # live mode is on → restart
             self.live.start(
                 self.device_combo.currentData(), extract_board(self.current_module)
@@ -608,6 +713,7 @@ info = {
     def on_error(self, msg: str):
         self.indicator.setText("🔴")
         QMessageBox.critical(self, "Processing Error", msg)
+        self._export_act.setEnabled(False)
         self.statusBar().clearMessage()
 
     # ---------- Batch ----------
@@ -639,7 +745,7 @@ info = {
         if self.audio_path is None:
             return
         try:
-            audio, sr = load_audio(str(self.audio_path))  # ← CHANGED
+            audio, sr = load_audio_from_path(str(self.audio_path))  # ← CHANGED
             if audio.ndim == 1:
                 audio = np.expand_dims(audio, axis=1)
             sd.play(np.clip(audio, -1.0, 1.0), samplerate=sr)
@@ -661,7 +767,7 @@ info = {
 
     def _on_device_change(self, _idx: int):
         dev_idx = self.device_combo.currentData()
-        if dev_idx == -1:  # “None” selected
+        if dev_idx == -1:  # "None" selected
             self.live.stop()
             return
 
@@ -669,13 +775,13 @@ info = {
             QMessageBox.information(
                 self, "No board yet", "Compile a script first, then enable live input."
             )
-            self.device_combo.setCurrentIndex(0)  # back to “None”
+            self.device_combo.setCurrentIndex(0)  # back to "None"
             return
 
         board = extract_board(self.current_module)
         if board is None:
             QMessageBox.warning(
-                self, "No board", "Current script doesn’t define 'effected' or 'board'."
+                self, "No board", "Current script doesn't define 'effected' or 'board'."
             )
             self.device_combo.setCurrentIndex(0)
             return
